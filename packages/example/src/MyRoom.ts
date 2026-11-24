@@ -9,6 +9,7 @@ import { database } from "./db/database.ts";
 // the dependency for anyone reading just this room file.
 import "@colyseus/auth";
 import { TrackUserSessionsPlugin } from "colyseus/plugins/track-user-sessions";
+import { PierClock, PIER_START_X, PIER_START_Y, PIER_STEP_PIXELS } from "./clock.ts";
 
 const VERSION = 5;
 
@@ -72,6 +73,9 @@ type Input = SchemaType<typeof Input>;
 
 export class MyRoom extends Room<{ state: MyRoomState, client: MyClient, input: Input }> {
   state = new MyRoomState();
+
+  /** Deterministic millisecond/tick source for the pier walker and canvas. */
+  pierClock = new PierClock({ name: "my_room" });
 
   // Database-driven plugins — one instance per room. The framework
   // walks this record at __init, computes the lifecycle/message layout
@@ -137,6 +141,19 @@ export class MyRoom extends Room<{ state: MyRoomState, client: MyClient, input: 
     this.state.mapWidth = 800;
     this.state.mapHeight = 600;
 
+    const applyClockControl = (message: any = {}) => {
+      if (typeof message?.ms === "number") { this.pierClock.seek(message.ms); }
+      if (message?.paused === true || message?.action === "pause") { this.pierClock.pause(); }
+      if (message?.paused === false || message?.action === "resume") { this.pierClock.resume(); }
+      const nextRate = message?.rate ?? message?.multiplier ?? message?.intervalMultiplier;
+      if (typeof nextRate === "number") { this.pierClock.setRate(nextRate); }
+      this.broadcast("pier-clock", this.pierClock.snapshot());
+    };
+    this.onMessage("pier-clock", (_client, message) => applyClockControl(message));
+    this.onMessage("clock:pause", () => applyClockControl({ action: "pause" }));
+    this.onMessage("clock:resume", () => applyClockControl({ action: "resume" }));
+    this.onMessage("clock:rate", (_client, message) => applyClockControl(message));
+
     this.onMessage("__move", (client, message) => {})
     this.onMessage("__dummy", (client, message) => { })
 
@@ -151,10 +168,28 @@ export class MyRoom extends Room<{ state: MyRoomState, client: MyClient, input: 
 
   onJoin(client: MyClient, options: any) {
     const player = new Player();
-    player.x = Math.random() * this.state.mapWidth;
-    player.y = Math.random() * this.state.mapHeight;
+    // Entering the room always lands the first dot at the pier start.
+    player.x = PIER_START_X;
+    player.y = PIER_START_Y;
     this.state.players.set(client.sessionId, player);
+    client.send("pier-clock", this.pierClock.snapshot());
     console.log("ON JOIN", { VERSION });
+  }
+
+  /** Pause the authoritative pier timeline and tell canvases to freeze. */
+  pausePierClock(atMs?: number) {
+    this.pierClock.pause(atMs);
+    this.broadcast("pier-clock", this.pierClock.snapshot());
+  }
+
+  resumePierClock(atMs?: number) {
+    this.pierClock.resume(atMs);
+    this.broadcast("pier-clock", this.pierClock.snapshot());
+  }
+
+  setPierClockRate(rate: number) {
+    this.pierClock.setRate(rate);
+    this.broadcast("pier-clock", this.pierClock.snapshot());
   }
 
   public onReconnect(client: MyClient): void | Promise<any> {
@@ -162,10 +197,18 @@ export class MyRoom extends Room<{ state: MyRoomState, client: MyClient, input: 
   }
 
   update() {
-    // this.state.players.forEach((player, key) => {
-    //   player.x += 1;
-    //   player.y += 1;
-    // });
+    if (this.pierClock.paused) { return; }
+
+    // One room beat is one deterministic 2px step. A changed time multiplier
+    // carries that many fixed steps in the beat.
+    const steps = Math.max(1, Math.round(this.pierClock.rate));
+    this.pierClock.step(steps);
+    this.state.players.forEach((player) => {
+      player.x += PIER_STEP_PIXELS * steps;
+      player.y = PIER_START_Y;
+    });
+
+    this.broadcast("pier-clock", this.pierClock.snapshot());
   }
 
   async onLeave(client, code: number) {

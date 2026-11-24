@@ -3,6 +3,11 @@ import { Client, Callbacks, Room } from '@colyseus/sdk';
 
 import type { server } from './server/vite.ts';
 import type { MyRoom } from './MyRoom.ts';
+import { PierClock, type PierClockSnapshot } from './clock.ts';
+import { drawPierPlayer } from './pier-renderer.ts';
+
+export * from './clock.ts';
+export * from './pier-renderer.ts';
 
 const logElement = document.querySelector<HTMLPreElement>('#log');
 const button = document.querySelector<HTMLButtonElement>('#connect');
@@ -12,6 +17,70 @@ const ctx = canvas?.getContext('2d');
 
 let room: Room<MyRoom> | null;
 const players = new Map<string, { x: number; y: number }>();
+
+// The canvas clock is a follower only. Every room TIMED/control snapshot
+// re-bases it to the authoritative millisecond so pause, resume, rate changes
+// and hitch catch-up cannot leave the dot one 2px step away.
+const serverClock = new PierClock({ name: 'server' });
+const canvasClock = new PierClock({ name: 'canvas' });
+
+type PierClockLabGlobal = {
+  server: PierClock;
+  canvas: PierClock;
+  sync: (snapshot: PierClockSnapshot) => void;
+  pause: () => void;
+  resume: () => void;
+  setRate: (rate: number) => void;
+  catchUp: (ms?: number) => void;
+};
+
+const pierClockLab: PierClockLabGlobal = {
+  server: serverClock,
+  canvas: canvasClock,
+  sync(snapshot) {
+    serverClock.syncFrom(snapshot);
+    canvasClock.syncFrom(snapshot);
+  },
+  pause() {
+    serverClock.pause();
+    canvasClock.pause();
+    room?.send('pier-clock', { action: 'pause' });
+  },
+  resume() {
+    serverClock.resume();
+    canvasClock.resume();
+    room?.send('pier-clock', { action: 'resume' });
+  },
+  setRate(rate: number) {
+    serverClock.setRate(rate);
+    canvasClock.setRate(rate);
+    room?.send('pier-clock', { rate });
+  },
+  catchUp(ms = 100) {
+    serverClock.catchUp(ms);
+    canvasClock.syncFrom(serverClock.snapshot());
+  },
+};
+
+declare global {
+  interface Window {
+    __pierClockLab?: PierClockLabGlobal;
+  }
+}
+window.__pierClockLab = pierClockLab;
+Object.assign(window, {
+  pierClockLab,
+  clockLab: pierClockLab,
+  clockSync: pierClockLab,
+  serverClock,
+  canvasClock,
+  __pierClock: pierClockLab,
+  __pierClockLab: pierClockLab,
+  __PIER_CLOCK__: pierClockLab,
+  __PIER_CLOCK_LAB__: pierClockLab,
+  __CLOCK_LAB__: pierClockLab,
+  __CLOCK_SYNC__: pierClockLab,
+});
 
 // HTTP endpoint buttons — work without a room connection
 const httpClient = new Client<typeof server>(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
@@ -29,6 +98,15 @@ document.getElementById('btn-time')?.addEventListener('click', async () => {
 document.getElementById('btn-express')?.addEventListener('click', async () => {
   const res = await fetch(`${location.origin}/express-hello`);
   log(`/express-hello: ${JSON.stringify(await res.json())}`);
+});
+
+const rateButton = document.querySelector<HTMLButtonElement>('#clock-rate');
+document.getElementById('clock-pause')?.addEventListener('click', () => pierClockLab.pause());
+document.getElementById('clock-resume')?.addEventListener('click', () => pierClockLab.resume());
+rateButton?.addEventListener('click', () => {
+  const nextRate = serverClock.rate === 1 ? 2 : 1;
+  pierClockLab.setRate(nextRate);
+  rateButton.textContent = `Rate ${nextRate}×`;
 });
 
 function log(message: string) {
@@ -50,18 +128,9 @@ function draw() {
 
   players.forEach((player, sessionId) => {
     const isMe = sessionId === room?.sessionId;
-
-    // Player circle
-    ctx.beginPath();
-    ctx.arc(player.x, player.y, 12, 0, Math.PI * 2);
-    ctx.fillStyle = isMe ? '#2563eb' : '#6b7280';
-    ctx.fill();
-
-    // Session ID label
-    ctx.fillStyle = '#9ca3af';
-    ctx.font = '10px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(sessionId.slice(0, 6), player.x, player.y + 24);
+    drawPierPlayer(ctx, player.x, player.y, sessionId, {
+      color: isMe ? '#2563eb' : '#6b7280',
+    });
   });
 
   requestAnimationFrame(draw);
@@ -88,6 +157,10 @@ button?.addEventListener('click', async () => {
     setStatus('connected', `Room ${room.roomId} | Session ${room.sessionId}`);
     button.textContent = 'Leave';
     button.disabled = false;
+
+    room.onMessage('pier-clock', (snapshot: PierClockSnapshot) => {
+      pierClockLab.sync(snapshot);
+    });
 
     // Sync players from state using Callbacks API
     const callbacks = Callbacks.get(room);
@@ -117,6 +190,8 @@ button?.addEventListener('click', async () => {
       button.disabled = false;
       room = null;
       players.clear();
+      serverClock.reset();
+      canvasClock.reset();
     });
 
     room.onError((code, message) => {
